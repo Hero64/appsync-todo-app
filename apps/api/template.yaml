@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AppSync API for todo app
+  
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  TaskTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+        - AttributeName: uuid
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+        - AttributeName: uuid
+          KeyType: RANGE
+
+  DatabaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+      Policies:
+        - PolicyName: DDBAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: "*"
+
+  AppSyncApi:
+    Type: "AWS::AppSync::GraphQLApi"
+    Properties:
+      Name: TodoAppApi
+      AuthenticationType: "API_KEY"
+
+  AppSyncApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties: 
+      ApiId: !GetAtt AppSyncApi.ApiId
+
+  AppSyncSchema:
+    Type: "AWS::AppSync::GraphQLSchema"
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Definition: |
+        type Mutation {
+          createTask(username: String!, message: String!, additionalData: AWSJSON): Task
+          updateTask(
+            username: String!,
+            uuid: String!,
+            message: String!,
+            status: Status!
+          ): Task
+        }
+
+        type Query {
+          tasksByUser(username: String): [Task]
+        }
+
+        enum Status {
+          PENDING
+          RESOLVED
+        }
+
+        type Subscription {
+          createOrUpdateTask(username: String): Task
+            @aws_subscribe(mutations: ["createTask","updateTask"])
+        }
+
+        type Task {
+          username: String
+          uuid: String
+          message: String
+          status: Status
+          created_at: AWSDateTime
+          updated_at: AWSDateTime
+          additionalData: AWSJSON
+        }
+
+        schema {
+          query: Query
+          mutation: Mutation
+          subscription: Subscription
+        }
+
+  TaskDataSource:
+    Type: "AWS::AppSync::DataSource"
+    Properties:
+      Name: TaskDataSource
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt DatabaseRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref TaskTable
+        AwsRegion: !Sub ${AWS::Region}
+
+  TasksResolver:
+    Type: "AWS::AppSync::Resolver"
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: tasksByUser
+      DataSourceName: !GetAtt TaskDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version" : "2017-02-28",
+          "operation" : "Query",
+          "query" : {
+            "expression": "username = :username",
+            "expressionValues" : {
+                ":username" : $util.dynamodb.toDynamoDBJson($ctx.args.username)
+            }
+          }
+        }
+      ResponseMappingTemplate: $util.toJson($context.result.items)
+
+  CreateTaskResolver:
+    Type: "AWS::AppSync::Resolver"
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: createTask
+      DataSourceName: !GetAtt TaskDataSource.Name
+      RequestMappingTemplate: |
+        #set($time = $util.dynamodb.toDynamoDBJson($util.time.nowFormatted("yyyy-MM-dd'T'HH:mm:ss[XXXXX]", "-07:00:30")))
+        {
+          "version": "2018-05-29",
+          "operation": "PutItem",
+          "key": {
+            "username": $util.dynamodb.toDynamoDBJson($ctx.args.username),
+            "uuid": $util.dynamodb.toDynamoDBJson($util.autoId())
+          },
+          "attributeValues": {
+            "message": $util.dynamodb.toDynamoDBJson($ctx.args.message),
+            "additionalData": $util.dynamodb.toDynamoDBJson($ctx.args.additionalData),
+            "status": $util.dynamodb.toDynamoDBJson("PENDING"),
+            "created_at": $time,
+            "updated_at": $time
+          }
+        }
+
+      ResponseMappingTemplate: "$util.toJson($ctx.result)"
+
+  UpdateResolver:
+    Type: "AWS::AppSync::Resolver"
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: updateTask
+      DataSourceName: !GetAtt TaskDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2018-05-29",
+          "operation": "UpdateItem",
+          "key": {
+            "username": $util.dynamodb.toDynamoDBJson($ctx.args.username),
+            "uuid": $util.dynamodb.toDynamoDBJson($ctx.args.uuid)
+          },
+          "update": {
+            "expression" : "SET #message = :message, #status = :status, #updated_at = :updated_at",
+                "expressionNames" : {
+                    "#message" : "message",
+                    "#status": "status",
+                    "#updated_at": "updated_at"
+                },
+                "expressionValues" : {
+                    ":message" : $util.dynamodb.toDynamoDBJson($ctx.args.message),
+                    ":status":  $util.dynamodb.toDynamoDBJson($ctx.args.status),
+                    ":updated_at": $util.dynamodb.toDynamoDBJson($util.time.nowFormatted("yyyy-MM-dd'T'HH:mm:ss[XXXXX]", "-07:00:30"))
+                }
+          }
+        }
+
+      ResponseMappingTemplate: "$util.toJson($ctx.result)"
+
+Outputs:
+  AppSyncUrl:
+    Description: "Graphql URL"
+    Value: !GetAtt AppSyncApi.GraphQLUrl
